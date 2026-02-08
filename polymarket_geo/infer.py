@@ -113,6 +113,7 @@ class LocationInferenceEngine:
             locations = filtered
 
         event_type = self.pipeline.event_classifier.predict(composed)
+        locations = self._refine_specificity(locations, event_type, composed.combined_text)
         geo_type = self.pipeline.geo_decider.decide([l.confidence for l in locations], event_type)
 
         if locations:
@@ -138,6 +139,76 @@ class LocationInferenceEngine:
             locations = []
 
         return GeoInferenceOutput(geo_type=geo_type, event_type=event_type, locations=locations)
+
+    def _refine_specificity(
+        self,
+        locations: list[LocationHypothesis],
+        event_type: str,
+        combined_text: str,
+    ) -> list[LocationHypothesis]:
+        if not locations:
+            return locations
+
+        refined = locations[:]
+
+        # Prefer narrower granularity if both broad and specific candidates are
+        # tied to the same country and confidence is comparable.
+        cities = [l for l in refined if l.granularity == "city"]
+        if cities:
+            city_countries = {self._country_for_location(c) for c in cities}
+            city_countries.discard(None)
+            refined = [
+                l
+                for l in refined
+                if not (l.granularity == "country" and l.name in city_countries)
+            ]
+
+        # For policy-oriented prompts, if only country-level results are found,
+        # default to that country's capital city from local data when available.
+        policy_like = self._is_policy_like(event_type, combined_text)
+        if policy_like and refined and all(l.granularity == "country" for l in refined):
+            upgraded: list[LocationHypothesis] = []
+            for loc in refined:
+                capital = self.pipeline.indexes.capital_for_country(loc.name)
+                if capital is None:
+                    upgraded.append(loc)
+                    continue
+                upgraded.append(
+                    LocationHypothesis(
+                        place_id=capital.place_id,
+                        name=capital.place_name,
+                        lat=capital.lat,
+                        lon=capital.lon,
+                        granularity=capital.granularity,
+                        confidence=max(0.0, min(1.0, loc.confidence * 0.95)),
+                        evidence=loc.evidence,
+                    )
+                )
+            refined = upgraded
+
+        refined.sort(key=lambda x: x.confidence, reverse=True)
+        return refined
+
+    def _is_policy_like(self, event_type: str, combined_text: str) -> bool:
+        if event_type in {"election", "geopolitics", "finance"}:
+            return True
+        model = self.pipeline.indexes.embedder
+        qv = model.embed(combined_text)
+        pv = model.embed(
+            "government policy legislation regulation court election federal parliament congress "
+            "immigration deportation border enforcement sanctions"
+        )
+        sim = model.cosine(qv, pv)
+        return sim >= 0.08
+
+    def _country_for_location(self, location: LocationHypothesis) -> str | None:
+        records = self.pipeline.indexes.records_for_place(location.place_id)
+        if not records:
+            return None
+        for rec in records:
+            if rec.country:
+                return rec.country
+        return None
 
     def infer(
         self,

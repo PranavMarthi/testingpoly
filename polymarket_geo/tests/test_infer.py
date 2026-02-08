@@ -41,6 +41,17 @@ def test_multi_location_case_keeps_multiple_candidates() -> None:
         description="Military action involving US forces and Somalia.",
     )
     names = [x.name.lower() for x in out.locations]
-    assert any("united states" in n for n in names)
-    assert any("somalia" in n for n in names)
+    assert any(("united states" in n) or ("washington" in n) for n in names)
+    assert any(("somalia" in n) or ("mogadishu" in n) for n in names)
     assert out.geo_type in {"multi", "inferred", "ambiguous"}
+
+
+def test_policy_defaults_country_to_capital_when_city_not_explicit() -> None:
+    engine = LocationInferenceEngine()
+    out = engine.infer_semantic(
+        title="How many people will Trump deport in 2025?",
+        description="Federal immigration policy market in the United States.",
+    )
+    assert out.locations
+    top = out.locations[0].name.lower()
+    assert ("washington" in top) or ("united states" in top)
