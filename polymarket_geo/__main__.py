@@ -1,57 +1,58 @@
-"""
-CLI entrypoint for the Polymarket Geo pipeline.
-
-Usage:
-    python -m polymarket_geo serve       # Start API server + scheduler
-    python -m polymarket_geo run         # Run pipeline once and exit
-    python -m polymarket_geo migrate     # Run DB migrations only
-    python -m polymarket_geo infer-test  # Test inference on sample texts
-    python -m polymarket_geo try         # Interactive: type a title, get geo data
-    python -m polymarket_geo try "title" # One-shot: infer geo for a single title
-"""
+"""CLI entrypoint for polymarket_geo."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import sys
+import json
 
 from polymarket_geo.logging_config import setup_logging
+from polymarket_geo.semantic.output_schema import GeoInferenceOutput
 
 
-def main():
+def main() -> None:
     setup_logging()
 
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(prog="polymarket-geo")
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    command = sys.argv[1]
+    sub.add_parser("serve")
+    sub.add_parser("run")
+    sub.add_parser("migrate")
 
-    if command == "serve":
+    infer_parser = sub.add_parser("infer")
+    infer_parser.add_argument("--title", required=True)
+    infer_parser.add_argument("--description", default="")
+    infer_parser.add_argument("--choice", action="append", default=[])
+    infer_parser.add_argument("--top-k", type=int, default=5)
+
+    try_parser = sub.add_parser("try")
+    try_parser.add_argument("title", nargs="?")
+    try_parser.add_argument("--description", default="")
+    try_parser.add_argument("--choice", action="append", default=[])
+
+    args = parser.parse_args()
+
+    if args.command == "serve":
         _serve()
-    elif command == "run":
+    elif args.command == "run":
         asyncio.run(_run_once())
-    elif command == "migrate":
+    elif args.command == "migrate":
         asyncio.run(_migrate())
-    elif command == "infer-test":
-        _infer_test()
-    elif command == "try":
-        _try_interactive()
-    else:
-        print(f"Unknown command: {command}")
-        print(__doc__)
-        sys.exit(1)
+    elif args.command == "infer":
+        _infer_once(args.title, args.description, args.choice, args.top_k)
+    elif args.command == "try":
+        _try_mode(args.title, args.description, args.choice)
 
 
-def _serve():
-    """Start FastAPI server with embedded scheduler."""
+def _serve() -> None:
     import uvicorn
+
     from polymarket_geo.config import get_settings
     from polymarket_geo.scheduler import start_scheduler
 
     settings = get_settings()
     start_scheduler()
-
     uvicorn.run(
         "polymarket_geo.api:app",
         host=settings.api.host,
@@ -61,135 +62,81 @@ def _serve():
     )
 
 
-async def _run_once():
-    """Run the full pipeline once."""
+async def _run_once() -> None:
     from polymarket_geo.scheduler import run_once
+
     stats = await run_once()
     print(f"Pipeline completed: {stats}")
 
 
-async def _migrate():
-    """Run database migrations."""
+async def _migrate() -> None:
     from polymarket_geo.db import close_pool, get_pool, run_migrations
+
     await get_pool()
     await run_migrations()
     await close_pool()
     print("Migrations applied successfully.")
 
 
-def _infer_test():
-    """Test the inference engine on sample market texts."""
+def _infer_once(title: str, description: str, choices: list[str], top_k: int) -> None:
+    from polymarket_geo.infer import LocationInferenceEngine
+
+    engine = LocationInferenceEngine()
+    out = engine.infer_semantic(title=title, description=description, choices=choices, top_k=top_k)
+    print(json.dumps(out.model_dump(), ensure_ascii=True, indent=2))
+
+
+def _try_mode(initial_title: str | None, description: str, choices: list[str]) -> None:
     from polymarket_geo.infer import LocationInferenceEngine
 
     engine = LocationInferenceEngine()
 
-    samples = [
-        ("Highest temperature in Atlanta on February 7?", None),
-        ("Atlanta Hawks vs Lakers", None),
-        ("What will Trump say this week?", None),
-        ("Will the Fed cut rates?", "The Federal Reserve is expected to announce its decision on interest rates."),
-        ("BTC price above 100k by Friday?", None),
-        ("Will Russia invade another country?", None),
-        ("Super Bowl LVIII winner?", "The game will be played at Allegiant Stadium in Las Vegas."),
-        ("Manchester United vs Arsenal Premier League match", None),
-        ("Will Congress pass the spending bill?", None),
-        ("Earthquake in California this month?", None),
-    ]
+    def run_once(title: str, desc: str, ch: list[str]) -> None:
+        out = engine.infer_semantic(title=title, description=desc, choices=ch)
+        _print_cli_result(title, out)
 
-    print("\n" + "=" * 80)
-    print("INFERENCE ENGINE TEST")
-    print("=" * 80)
-
-    for question, description in samples:
-        result = engine.infer("test-id", question, description)
-        print(f"\n{'─' * 60}")
-        print(f"Q: {question}")
-        if description:
-            print(f"D: {description[:80]}...")
-        print(f"Global: {result.is_global} | Has Location: {result.has_location}")
-        for loc in result.locations:
-            print(f"  → {loc.location_name:30s} "
-                  f"conf={loc.confidence:.2f}  "
-                  f"type={loc.location_type.value:10s}  "
-                  f"method={loc.inference_method.value}")
-            print(f"    reason: {loc.reason[:100]}")
-
-    print(f"\n{'=' * 80}")
-
-
-def _try_interactive():
-    """
-    Interactive mode: type a market title and instantly see inferred geo data.
-    Also supports one-shot: python -m polymarket_geo try "Will the Fed cut rates?"
-    """
-    import logging
-    logging.disable(logging.WARNING)  # suppress spacy/config warnings for clean output
-
-    from polymarket_geo.infer import LocationInferenceEngine
-
-    engine = LocationInferenceEngine()
-
-    def _print_result(title: str):
-        result = engine.infer("interactive", title)
-        has_not_available = any(loc.location_name == "not_available" for loc in result.locations)
-
-        print()
-        if has_not_available:
-            print("  Type:   Event venue not available yet")
-        elif result.is_global and not result.has_location:
-            print(f"  Type:   Global (no specific geography)")
-        elif result.has_location:
-            print(f"  Type:   Location-specific")
-        else:
-            print(f"  Type:   Unknown / no locations inferred")
-
-        print(f"  Locations found: {len(result.locations)}")
-
-        if not result.locations:
-            print("  (none)")
-            return
-
-        print()
-        for i, loc in enumerate(result.locations, 1):
-            print(f"  {i}. {loc.location_name}")
-            print(f"     Confidence:  {loc.confidence:.0%}")
-            print(f"     Type:        {loc.location_type.value}")
-            print(f"     Method:      {loc.inference_method.value}")
-            if loc.latitude is not None and loc.longitude is not None:
-                print(f"     Coords:      {loc.latitude:.4f}, {loc.longitude:.4f}")
-            print(f"     Reason:      {loc.reason}")
-            print()
-
-    # One-shot mode: python -m polymarket_geo try "some title here"
-    if len(sys.argv) > 2:
-        title = " ".join(sys.argv[2:])
-        print(f"\n  Market: {title}")
-        _print_result(title)
+    if initial_title:
+        run_once(initial_title, description, choices)
         return
 
-    # Interactive REPL
-    print()
-    print("  Polymarket Geo - Interactive Tester")
-    print("  ====================================")
-    print("  Type a prediction market title and press Enter.")
-    print("  Type 'quit' or Ctrl+C to exit.")
-    print()
+    print("Semantic Geo Interactive")
+    print("Enter title, optional description, optional choices (comma separated).")
+    print("Type 'quit' to exit.")
 
     while True:
-        try:
-            title = input("  > ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\n")
-            break
-
+        title = input("title> ").strip()
         if not title:
             continue
-        if title.lower() in ("quit", "exit", "q"):
+        if title.lower() in {"quit", "exit", "q"}:
             break
+        desc = input("description> ").strip()
+        raw_choices = input("choices (comma separated)> ").strip()
+        ch = [c.strip() for c in raw_choices.split(",") if c.strip()] if raw_choices else []
+        run_once(title, desc, ch)
 
-        print(f"\n  Market: {title}")
-        _print_result(title)
-        print(f"  {'─' * 50}")
+
+def _print_cli_result(title: str, out: GeoInferenceOutput) -> None:
+    print("\n" + "-" * 72)
+    print(f"Market: {title}")
+    print(f"Geo type: {out.geo_type}")
+    print(f"Event type: {out.event_type}")
+    print(f"Locations found: {len(out.locations)}")
+
+    if not out.locations:
+        print("(none)")
+        return
+
+    for i, loc in enumerate(out.locations, 1):
+        print(f"\n{i}. {loc.name}")
+        print(f"   Confidence:  {loc.confidence:.0%}")
+        print(f"   Granularity: {loc.granularity}")
+        print(f"   Coords:      {loc.lat:.4f}, {loc.lon:.4f}")
+        print(f"   Place ID:    {loc.place_id}")
+        if loc.evidence:
+            best = sorted(loc.evidence, key=lambda e: e.score, reverse=True)[:2]
+            print("   Evidence:")
+            for ev in best:
+                print(f"   - {ev.field}: {ev.snippet[:80]} (score={ev.score:.2f})")
 
 
 if __name__ == "__main__":

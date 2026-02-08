@@ -11,3 +11,7 @@ dist/
 .ruff_cache/
 .DS_Store
 polymarket_geo/event_venue_cache.sqlite
+polymarket_geo/event_venue_cache_v2.sqlite
+polymarket_geo/entity_geo_cache.sqlite
+data/semantic/records.jsonl
+data/semantic/vectors.npy

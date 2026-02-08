@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "polymarket-geo"
 version = "1.0.0"
 description = "Polymarket prediction market geographic inference pipeline and API"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 
 dependencies = [
@@ -21,6 +21,8 @@ dependencies = [
     "spacy>=3.7.0",
     # Data validation
     "pydantic>=2.6.0",
+    # Numeric vector ops for local retrieval
+    "numpy>=1.26.0",
     # Scheduling
     "APScheduler>=3.10.0",
 ]
